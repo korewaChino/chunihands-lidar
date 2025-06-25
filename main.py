@@ -10,6 +10,7 @@ import websockets
 from concurrent.futures import ThreadPoolExecutor
 import threading
 import queue
+from threading import Timer
 
 THRESHOLD_ZONES = {
     "zone1": (0.350, 0.325),  # Zone 1: 350mm to 325mm
@@ -66,6 +67,51 @@ def create_input_packet(events, device_id="chuhands-lidar"):
     return packet
 
 
+def get_zone_number(zone_name):
+    """Convert zone name to number for ordering (zone1=1, zone6=6)"""
+    if zone_name is None:
+        return None
+    return int(zone_name.replace("zone", ""))
+
+
+def get_zones_between(start_zone, end_zone):
+    """Get all zones between start and end (inclusive)"""
+    if start_zone is None or end_zone is None:
+        return []
+
+    start_num = get_zone_number(start_zone)
+    end_num = get_zone_number(end_zone)
+
+    if start_num == end_num:
+        return [start_zone]
+
+    # Determine direction
+    if start_num < end_num:
+        return [f"zone{i}" for i in range(start_num, end_num + 1)]
+    else:
+        return [f"zone{i}" for i in range(start_num, end_num - 1, -1)]
+
+
+def send_key_press(zone_name):
+    """Send a key press event for a specific zone"""
+    if zone_name in ZONE_KEY_MAP:
+        key = ZONE_KEY_MAP[zone_name]
+        key_press_event = key_press_template(key)
+        packet = create_input_packet([key_press_event])
+        print(f"KeyPress: {key} ({zone_name})")
+        send_packet_to_websocket(packet)
+
+
+def send_key_release(zone_name):
+    """Send a key release event for a specific zone"""
+    if zone_name in ZONE_KEY_MAP:
+        key = ZONE_KEY_MAP[zone_name]
+        key_release_event = key_release_template(key)
+        packet = create_input_packet([key_release_event])
+        print(f"KeyRelease: {key} ({zone_name})")
+        send_packet_to_websocket(packet)
+
+
 def handle_zone_entry(zone_name, depth_value):
     """
     Handle the entry into a specific zone based on the depth value.
@@ -77,7 +123,8 @@ def handle_zone_entry(zone_name, depth_value):
         key = ZONE_KEY_MAP[zone_name]
         key_press_event = key_press_template(key)
         packet = create_input_packet([key_press_event])
-        print(f"Generated KeyPress event: {json.dumps(packet, indent=2)}")
+        # Remove verbose JSON printing for performance
+        print(f"KeyPress: {key}")
 
         # Send to WebSocket
         send_packet_to_websocket(packet)
@@ -97,7 +144,8 @@ def handle_zone_exit(zone_name, depth_value):
         key = ZONE_KEY_MAP[zone_name]
         key_release_event = key_release_template(key)
         packet = create_input_packet([key_release_event])
-        print(f"Generated KeyRelease event: {json.dumps(packet, indent=2)}")
+        # Remove verbose JSON printing for performance
+        print(f"KeyRelease: {key}")
 
         # Send to WebSocket
         send_packet_to_websocket(packet)
@@ -175,7 +223,8 @@ class WebSocketManager:
                                 await asyncio.wait_for(
                                     websocket.send(message), timeout=1.0
                                 )
-                                print(f"Sent to WebSocket: {message}")
+                                # Reduce verbose logging for performance
+                                # print(f"Sent to WebSocket: {message}")
 
                             except queue.Empty:
                                 # Send ping to keep connection alive
@@ -227,6 +276,27 @@ class ClosestDepthApp:
         self.running = True
         self.current_zone = None  # Track the current zone
 
+        # Performance optimizations for minimal latency
+        self.show_visualization = True  # Disable visualization by default for speed
+
+        # Pre-compute zone boundaries for faster lookup
+        self.zone_boundaries = [
+            (min_depth, max_depth, zone_name)
+            for zone_name, (min_depth, max_depth) in THRESHOLD_ZONES.items()
+        ]
+
+        # Depth processing optimizations
+        self.last_depth_value = None
+        self.zone_change_threshold = 0.005  # 5mm threshold to prevent jitter
+
+        # CHUNITHM-style input handling
+        self.active_zones = set()  # Track all currently pressed zones
+        self.zone_release_timers = {}  # Track delayed releases
+        self.release_delay_ms = 10  # 10ms delay between releases
+
+        # Initialize WebSocket manager
+        self.websocket_manager = None
+
     def on_new_frame(self):
         """
         This method is called from non-main thread, therefore cannot be used for presenting UI.
@@ -255,25 +325,25 @@ class ClosestDepthApp:
         self.session.on_stream_stopped = self.on_stream_stopped
         self.session.connect(dev)  # Initiate connection and start capturing
 
-    def handle_zone_change(self, new_zone, depth_value):
+    def handle_zone_change_optimized(self, new_zone, depth_value):
         """
-        Handle zone transitions by calling appropriate handler functions
+        Optimized zone change handling with jitter prevention and CHUNITHM-style multi-key input
         """
+        # Only process if zone actually changed and passes jitter threshold
         if self.current_zone != new_zone:
-            # Exit the previous zone if there was one
-            if self.current_zone is not None:
-                handle_zone_exit(self.current_zone, depth_value)
+            if (
+                self.last_depth_value is None
+                or abs(depth_value - self.last_depth_value) > self.zone_change_threshold
+            ):
+                # Use CHUNITHM-style zone handling
+                self.handle_zone_change_chunithm(new_zone)
 
-            # Enter the new zone if there is one
-            if new_zone is not None:
-                handle_zone_entry(new_zone, depth_value)
-
-            # Update current zone
-            self.current_zone = new_zone
+                # Update last depth
+                self.last_depth_value = depth_value
 
     def get_zone_for_depth(self, depth_value):
         """
-        Determine which zone the depth value falls into
+        Determine which zone the depth value falls into (optimized version)
         Anything closer than 200mm gets bounded to zone 6
         """
         if depth_value is None:
@@ -283,35 +353,29 @@ class ClosestDepthApp:
         if depth_value < 0.200:
             return "zone6"
 
-        for zone_name, (min_depth, max_depth) in THRESHOLD_ZONES.items():
+        # Use pre-computed boundaries for faster lookup
+        for min_depth, max_depth, zone_name in self.zone_boundaries:
             if min_depth >= depth_value >= max_depth:
                 return zone_name
         return None
 
-    def find_closest_depth(self, depth_frame):
+    def find_closest_depth_optimized(self, depth_frame):
         """
-        Find the closest (minimum) depth value in the frame, excluding zeros
-        and excluding the last 55 pixels in Y direction (bottom of frame)
+        Ultra-fast depth processing - only find minimum, no position tracking
         """
-        # Create a zone excluding the last 55 pixels in Y direction
-        zone_depth = depth_frame[:-70, :]  # Exclude bottom 55 rows
+        # Create a zone excluding the last 70 pixels in Y direction
+        zone_depth = depth_frame[:-70, :]
 
-        # Filter out zero values (invalid depth readings)
+        # Fast minimum finding with numpy
         valid_depth = zone_depth[zone_depth > 0]
+        if len(valid_depth) == 0:
+            return None
 
-        if len(valid_depth) > 0:
-            closest_depth = np.min(valid_depth)
-            # Find the position of the closest depth within the zone
-            closest_pos = np.unravel_index(
-                np.argmin(np.where(zone_depth > 0, zone_depth, np.inf)),
-                zone_depth.shape,
-            )
-            return closest_depth, closest_pos
-        else:
-            return None, None
+        return np.min(valid_depth)
 
     def start_processing_stream(self):
-        print("Starting depth processing... Press 'q' to quit")
+        print("Starting LOW-LATENCY depth processing...")
+        print("Commands: 'q'=quit, 'v'=toggle visualization")
 
         try:
             while self.running:
@@ -320,100 +384,40 @@ class ClosestDepthApp:
                 if not self.running:
                     break
 
-                # Copy the newly arrived depth frame
+                # Get depth frame immediately - no copying overhead
                 depth = self.session.get_depth_frame()
-
                 if depth is None:
                     continue
 
-                # Postprocess if needed (flip for TrueDepth cameras)
+                # Skip TrueDepth flip for LiDAR devices (optimization)
                 if self.session.get_device_type() == self.DEVICE_TYPE__TRUEDEPTH:
                     depth = cv2.flip(depth, 1)
 
-                # Find the closest depth value
-                closest_depth, closest_pos = self.find_closest_depth(depth)
+                # Ultra-fast depth processing - only get minimum value
+                closest_depth = self.find_closest_depth_optimized(depth)
 
                 if closest_depth is not None:
                     zone = self.get_zone_for_depth(closest_depth)
-
-                    # Handle zone changes
-                    self.handle_zone_change(zone, closest_depth)
-
-                    zone_info = f" Zone: {zone}" if zone else ""
-                    # print(
-                    #     f"Closest depth: {closest_depth:.3f}m at position {closest_pos}{zone_info}"
-                    # )
+                    # Use optimized zone change handler
+                    self.handle_zone_change_optimized(zone, closest_depth)
                 else:
-                    # Handle case when no depth is detected (exit current zone)
-                    if self.current_zone is not None:
-                        handle_zone_exit(self.current_zone, None)
-                        self.current_zone = None
-                    print("No valid depth data found")
+                    # Handle case when no depth is detected (exit all zones)
+                    self.handle_zone_change_optimized(None, None)
 
-                # Optional: Display the depth frame with closest point highlighted
-                depth_display = cv2.normalize(
-                    depth, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U
-                )
-                depth_colored = cv2.applyColorMap(depth_display, cv2.COLORMAP_JET)
+                # Minimal visualization processing (only when enabled)
+                if self.show_visualization:
+                    self._update_visualization_minimal(depth, closest_depth)
 
-                # Draw a line to show the excluded zone (last 55 pixels in Y)
-                if depth.shape[0] > 55:
-                    zone_line_y = depth.shape[0] - 55
-                    cv2.line(
-                        depth_colored,
-                        (0, zone_line_y),
-                        (depth.shape[1], zone_line_y),
-                        (0, 0, 255),
-                        2,
-                    )
-                    cv2.putText(
-                        depth_colored,
-                        "Excluded Zone",
-                        (10, zone_line_y + 20),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6,
-                        (0, 0, 255),
-                        2,
-                    )
-
-                # Mark the closest point if found
-                if closest_pos is not None:
-                    zone = self.get_zone_for_depth(closest_depth)
-                    cv2.circle(
-                        depth_colored,
-                        (closest_pos[1], closest_pos[0]),
-                        10,
-                        (255, 255, 255),
-                        2,
-                    )
-                    # Show depth and zone information
-                    zone_text = f"Zone: {zone}" if zone else "No Zone"
-                    cv2.putText(
-                        depth_colored,
-                        f"{closest_depth:.3f}m",
-                        (closest_pos[1] + 15, closest_pos[0] - 15),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.7,
-                        (255, 255, 255),
-                        2,
-                    )
-                    cv2.putText(
-                        depth_colored,
-                        zone_text,
-                        (closest_pos[1] + 15, closest_pos[0] + 5),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6,
-                        (255, 255, 255),
-                        2,
-                    )
-
-                cv2.imshow("Depth with Closest Point", depth_colored)
-
-                # Check for quit key
+                # Minimal key processing
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("q"):
                     self.running = False
                     break
+                elif key == ord("v"):
+                    self.show_visualization = not self.show_visualization
+                    print(
+                        f"Visualization: {'ON' if self.show_visualization else 'OFF'}"
+                    )
 
                 self.event.clear()
 
@@ -421,9 +425,133 @@ class ClosestDepthApp:
             print("\nStopping...")
             self.running = False
         finally:
-            cv2.destroyAllWindows()
+            if self.show_visualization:
+                cv2.destroyAllWindows()
             if self.session:
                 self.session.stop_stream()
+
+    def _update_visualization_minimal(self, depth, closest_depth):
+        """
+        Minimal visualization for performance - only show essential info
+        """
+        # Simple depth visualization without expensive operations
+        depth_display = cv2.normalize(depth, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
+
+        # Show zone info as text overlay only
+        if closest_depth is not None:
+            zone = self.get_zone_for_depth(closest_depth)
+            zone_text = f"Zone: {zone} | Depth: {closest_depth:.3f}m"
+            cv2.putText(
+                depth_display,
+                zone_text,
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 255, 255),
+                2,
+            )
+
+        cv2.imshow("Depth (Minimal)", depth_display)
+
+    def handle_zone_change_chunithm(self, new_zone):
+        """Handle zone changes with CHUNITHM-style multi-key input for rapid transitions"""
+        old_zone = self.current_zone
+
+        if old_zone == new_zone:
+            return  # No change
+
+        # Clear any existing release timers
+        for timer in self.zone_release_timers.values():
+            timer.cancel()
+        self.zone_release_timers.clear()
+
+        # If we were in a zone and now leaving
+        if old_zone is not None and new_zone is None:
+            # Release all active zones
+            for zone in list(self.active_zones):
+                send_key_release(zone)
+                self.active_zones.discard(zone)
+            print(f"Zone transition: {old_zone} -> None")
+
+        # If we're entering a zone from nothing
+        elif old_zone is None and new_zone is not None:
+            # Press the new zone key
+            send_key_press(new_zone)
+            self.active_zones.add(new_zone)
+            print(f"Zone transition: None -> {new_zone}")
+
+        # If we're changing from one zone to another
+        elif old_zone is not None and new_zone is not None:
+            old_num = get_zone_number(old_zone)
+            new_num = get_zone_number(new_zone)
+
+            # Check if it's a rapid transition (skipping zones)
+            if abs(new_num - old_num) > 1:
+                print(f"Rapid zone transition detected: {old_zone} -> {new_zone}")
+
+                # Get all zones between old and new (inclusive)
+                zones_to_press = get_zones_between(old_zone, new_zone)
+
+                # Press all intermediate keys immediately
+                for zone in zones_to_press:
+                    if (
+                        zone not in self.active_zones
+                    ):  # Don't re-press already active zones
+                        send_key_press(zone)
+                        self.active_zones.add(zone)
+
+                # Schedule releases in reverse order with delay
+                # Use the WebSocket manager's event loop for timed releases
+                async def release_keys_with_delay():
+                    # Release keys in reverse order (highest to lowest if moving up, lowest to highest if moving down)
+                    zones_to_release = zones_to_press[:-1]  # All except the final zone
+                    if old_num < new_num:
+                        # Moving up: release from highest to lowest
+                        zones_to_release.reverse()
+                    # Moving down: already in correct order (highest to lowest)
+
+                    for zone in zones_to_release:
+                        await asyncio.sleep(0.01)  # 10ms delay
+                        send_key_release(zone)
+                        self.active_zones.discard(zone)
+
+                # Schedule the release sequence on the WebSocket manager's event loop
+                if self.websocket_manager and self.websocket_manager.loop:
+                    asyncio.run_coroutine_threadsafe(
+                        release_keys_with_delay(), self.websocket_manager.loop
+                    )
+                else:
+                    # Fallback: use threading timer for compatibility
+                    def delayed_release(zone, delay):
+                        def release_action():
+                            send_key_release(zone)
+                            self.active_zones.discard(zone)
+
+                        timer = Timer(delay, release_action)
+                        timer.start()
+                        return timer
+
+                    zones_to_release = zones_to_press[:-1]
+                    if old_num < new_num:
+                        zones_to_release.reverse()
+
+                    for i, zone in enumerate(zones_to_release):
+                        timer = delayed_release(zone, (i + 1) * 0.01)  # 10ms intervals
+                        self.zone_release_timers[zone] = timer
+
+            else:
+                # Normal adjacent zone transition
+                if old_zone in self.active_zones:
+                    send_key_release(old_zone)
+                    self.active_zones.discard(old_zone)
+
+                if new_zone not in self.active_zones:
+                    send_key_press(new_zone)
+                    self.active_zones.add(new_zone)
+
+                print(f"Zone transition: {old_zone} -> {new_zone}")
+
+        self.current_zone = new_zone
 
 
 def main():
@@ -431,6 +559,7 @@ def main():
     ws_manager.start()
 
     app = ClosestDepthApp()
+    app.websocket_manager = ws_manager  # Assign the websocket manager to the app
     try:
         app.connect_to_device(dev_idx=0)
         app.start_processing_stream()
