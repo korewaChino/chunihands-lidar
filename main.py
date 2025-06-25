@@ -104,13 +104,14 @@ def handle_zone_exit(zone_name, depth_value):
 
 
 class WebSocketManager:
-    def __init__(self, url):
+    def __init__(self, url, max_queue_size=10):
         self.url = url
         self.websocket = None
-        self.message_queue = queue.Queue()
+        self.message_queue = queue.Queue(maxsize=max_queue_size)
         self.running = False
         self.loop = None
         self.thread = None
+        self.max_queue_size = max_queue_size
 
     def start(self):
         """Start the WebSocket manager in a background thread"""
@@ -127,7 +128,17 @@ class WebSocketManager:
     def send_message(self, message):
         """Add a message to the queue to be sent"""
         if self.running:
-            self.message_queue.put(message)
+            try:
+                # Try to put message without blocking
+                self.message_queue.put_nowait(message)
+            except queue.Full:
+                # If queue is full, remove oldest message and add new one
+                try:
+                    self.message_queue.get_nowait()  # Remove oldest
+                    self.message_queue.put_nowait(message)  # Add new
+                    print("WebSocket queue full, dropped oldest message")
+                except queue.Empty:
+                    pass
 
     def _run_websocket_thread(self):
         """Run the WebSocket event loop in a separate thread"""
@@ -144,31 +155,52 @@ class WebSocketManager:
         """Handle WebSocket connection and message sending"""
         while self.running:
             try:
-                async with websockets.connect(self.url) as websocket:
+                # Set connection timeout
+                async with websockets.connect(
+                    self.url,
+                    ping_timeout=10,
+                    close_timeout=5,
+                    max_size=2**16,  # Smaller max message size
+                ) as websocket:
                     self.websocket = websocket
                     print(f"Connected to WebSocket: {self.url}")
 
                     while self.running:
                         try:
-                            # Check for messages to send (non-blocking)
+                            # Check for messages to send with timeout
                             try:
-                                message = self.message_queue.get_nowait()
-                                await websocket.send(message)
-                                print(f"Sent to WebSocket: {message}")
-                            except queue.Empty:
-                                pass
+                                message = self.message_queue.get(timeout=0.1)
 
-                            # Small delay to prevent busy waiting
-                            await asyncio.sleep(0.01)
+                                # Send with timeout to prevent hanging
+                                await asyncio.wait_for(
+                                    websocket.send(message), timeout=1.0
+                                )
+                                print(f"Sent to WebSocket: {message}")
+
+                            except queue.Empty:
+                                # Send ping to keep connection alive
+                                await asyncio.wait_for(websocket.ping(), timeout=1.0)
+                            except asyncio.TimeoutError:
+                                print("WebSocket send timeout, reconnecting...")
+                                break
 
                         except websockets.exceptions.ConnectionClosed:
                             print("WebSocket connection closed, will reconnect...")
                             break
                         except Exception as e:
-                            print(f"Error sending message: {e}")
+                            print(f"Error in WebSocket loop: {e}")
+                            break
 
             except Exception as e:
                 print(f"WebSocket connection error: {e}")
+                # Clear the queue to prevent buildup during reconnection
+                while not self.message_queue.empty():
+                    try:
+                        self.message_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                print("Cleared message queue due to connection error")
+
                 if self.running:
                     print("Retrying connection in 2 seconds...")
                     await asyncio.sleep(2)
@@ -308,9 +340,9 @@ class ClosestDepthApp:
                     self.handle_zone_change(zone, closest_depth)
 
                     zone_info = f" Zone: {zone}" if zone else ""
-                    print(
-                        f"Closest depth: {closest_depth:.3f}m at position {closest_pos}{zone_info}"
-                    )
+                    # print(
+                    #     f"Closest depth: {closest_depth:.3f}m at position {closest_pos}{zone_info}"
+                    # )
                 else:
                     # Handle case when no depth is detected (exit current zone)
                     if self.current_zone is not None:
